@@ -1,0 +1,230 @@
+# ===========================================================================
+# Pipeline de FRONTEND.
+#
+# El frontend es un artefacto distinto del backend -objetos estaticos en Cloud
+# Storage, no un contenedor en Cloud Run- y se despliega de forma
+# independiente (D9b). Un cambio de CSS no paga el build de tres imagenes, el
+# escaneo de vulnerabilidades ni las migraciones de base de datos.
+#
+# Lo que hace seguro publicarlo sin coordinar con el backend es el contrato:
+#   - La llamada al API es relativa (/api, D3): el bundle no lleva dentro el
+#     host del backend, de modo que el mismo artefacto vale en cualquier
+#     ambiente.
+#   - El API mantiene compatibilidad con la version N-1 del cliente. No es una
+#     concesion al frontend: el canary de prod hace convivir dos revisiones del
+#     API sirviendo trafico, asi que ya es obligatorio.
+#
+# Flujo:
+#   PR            -> lint, test y build (sin publicar)
+#   merge a main  -> publicar en dev -> verificar -> publicar en qa -> verificar
+#   prod          -> aprobacion humana -> publicar -> invalidar CDN -> verificar
+# ===========================================================================
+
+name: Frontend
+
+on:
+  pull_request:
+    paths:
+      - "app/frontend/**"
+      - ".github/workflows/frontend.yml"
+  push:
+    branches: [main]
+    paths:
+      - "app/frontend/**"
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit validado en qa que se publica en prod
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  REGION: europe-west1
+
+jobs:
+  # -------------------------------------------------------------------------
+  build:
+    name: Lint, test y build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # En el despliegue manual a prod se publica el commit validado en qa,
+          # no la punta de main.
+          ref: ${{ inputs.sha || github.sha }}
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/frontend/package-lock.json
+
+      # npm ci y no npm install: instala exactamente el lockfile, lo que hace
+      # el build reproducible.
+      - run: npm ci
+        working-directory: app/frontend
+
+      - run: npm run lint
+        working-directory: app/frontend
+
+      - run: npm test -- --run
+        working-directory: app/frontend
+
+      - run: npm audit --audit-level=high
+        working-directory: app/frontend
+
+      # VITE_API_BASE es relativo: el mismo dominio sirve frontend y API (D3).
+      - name: Build de produccion
+        working-directory: app/frontend
+        run: |
+          set -euo pipefail
+          VITE_API_BASE=/api npm run build
+          test -f dist/index.html || { echo "El build no produjo dist/index.html"; exit 1; }
+
+      # El artefacto se construye UNA vez y se publica tal cual en los tres
+      # ambientes. Reconstruir por ambiente podria producir un bundle distinto,
+      # que es el mismo motivo por el que el backend promociona por digest
+      # (D11).
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: frontend-dist
+          path: app/frontend/dist
+          retention-days: 7
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Publicacion. Los tres ambientes repiten los mismos pasos sobre un bucket
+  # distinto, asi que van como matriz secuencial: si dev rompe, qa no se toca.
+  # -------------------------------------------------------------------------
+  publicar_dev:
+    name: Publicar en dev
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: frontend-dist
+          path: dist
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER_dev }}
+          service_account: ${{ vars.DEPLOYER_SA_dev }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      # El orden importa: primero los assets, despues index.html. Los assets
+      # llevan hash en el nombre, de modo que publicar los nuevos no invalida
+      # los que el index.html antiguo sigue pidiendo. Al reves, index.html
+      # pediria durante unos segundos assets que aun no existen.
+      - name: Publicar assets
+        run: |
+          gcloud storage rsync dist gs://${{ vars.FRONTEND_BUCKET_dev }} \
+            --recursive --delete-unmatched-destination-objects \
+            --cache-control="public, max-age=31536000, immutable" \
+            --exclude="index.html"
+
+      - name: Publicar index.html
+        run: |
+          gcloud storage cp dist/index.html \
+            gs://${{ vars.FRONTEND_BUCKET_dev }}/index.html \
+            --cache-control="no-cache, max-age=0"
+
+      # Solo /index.html: los assets son inmutables y cambian de nombre, de
+      # modo que invalidar todo seria tirar una cache que sigue siendo valida.
+      - name: Invalidar el CDN
+        run: |
+          gcloud compute url-maps invalidate-cdn-cache prov-dev-urlmap \
+            --path="/index.html" --async
+
+      - name: Verificar
+        run: curl -fsS --retry 5 --retry-delay 10 "${{ vars.URL_dev }}/" > /dev/null
+
+  # -------------------------------------------------------------------------
+  publicar_qa:
+    name: Publicar en qa
+    needs: publicar_dev
+    runs-on: ubuntu-latest
+    environment: qa
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: frontend-dist
+          path: dist
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER_qa }}
+          service_account: ${{ vars.DEPLOYER_SA_qa }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      - name: Publicar assets
+        run: |
+          gcloud storage rsync dist gs://${{ vars.FRONTEND_BUCKET_qa }} \
+            --recursive --delete-unmatched-destination-objects \
+            --cache-control="public, max-age=31536000, immutable" \
+            --exclude="index.html"
+
+      - name: Publicar index.html
+        run: |
+          gcloud storage cp dist/index.html \
+            gs://${{ vars.FRONTEND_BUCKET_qa }}/index.html \
+            --cache-control="no-cache, max-age=0"
+
+      - name: Invalidar el CDN
+        run: |
+          gcloud compute url-maps invalidate-cdn-cache prov-qa-urlmap \
+            --path="/index.html" --async
+
+      - name: Verificar
+        run: curl -fsS --retry 5 --retry-delay 10 "${{ vars.URL_qa }}/" > /dev/null
+
+  # -------------------------------------------------------------------------
+  publicar_prod:
+    name: Publicar en prod
+    if: github.event_name == 'workflow_dispatch'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: prod # revisores obligatorios: la aprobacion es humana
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: frontend-dist
+          path: dist
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER_prod }}
+          service_account: ${{ vars.DEPLOYER_SA_prod }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      # El bucket de prod conserva versiones de objeto (frontend_keep_versions),
+      # de modo que el rollback de un despliegue de frontend es restaurar la
+      # version anterior de index.html, sin reconstruir nada.
+      - name: Publicar assets
+        run: |
+          gcloud storage rsync dist gs://${{ vars.FRONTEND_BUCKET_prod }} \
+            --recursive --delete-unmatched-destination-objects \
+            --cache-control="public, max-age=31536000, immutable" \
+            --exclude="index.html"
+
+      - name: Publicar index.html
+        run: |
+          gcloud storage cp dist/index.html \
+            gs://${{ vars.FRONTEND_BUCKET_prod }}/index.html \
+            --cache-control="no-cache, max-age=0"
+
+      - name: Invalidar el CDN
+        run: |
+          gcloud compute url-maps invalidate-cdn-cache prov-prod-urlmap \
+            --path="/index.html" --async
+
+      - name: Verificar
+        run: curl -fsS --retry 5 --retry-delay 10 "${{ vars.URL_prod }}/" > /dev/null

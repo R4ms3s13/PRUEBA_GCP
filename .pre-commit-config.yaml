@@ -1,0 +1,67 @@
+# Comprobaciones antes de cada commit.
+#
+# Son las mismas que ejecuta el pipeline, pero en local y en segundos. Corregir
+# el formato en tu maquina cuesta nada; descubrirlo en un CI rojo cuesta un
+# ciclo de push, espera y nuevo commit.
+#
+# Instalacion (una vez por clon):
+#   pip install pre-commit
+#   pre-commit install
+#
+# Ejecutar sobre todo el repositorio sin commitear:
+#   pre-commit run --all-files
+
+repos:
+  - repo: https://github.com/antonbabenko/pre-commit-terraform
+    rev: v1.96.3
+    hooks:
+      # Formato canonico. Es el que mas veces salta y el mas barato de arreglar.
+      - id: terraform_fmt
+
+      # Sintaxis y coherencia de tipos. Con -backend=false no toca la nube.
+      - id: terraform_validate
+        args:
+          - --hook-config=--retry-once-with-cleanup=true
+          - --tf-init-args=-backend=false
+
+      # Linter con el plugin de Google. Ver .tflint.hcl.
+      - id: terraform_tflint
+        args:
+          - --args=--config=__GIT_WORKING_DIR__/.tflint.hcl
+
+      # Regenera la seccion de referencia de los README de modulo. Sin esto,
+      # anadir una variable deja la documentacion mintiendo.
+      - id: terraform_docs
+        args:
+          - --args=--config=.terraform-docs.yml
+
+      # Analisis de seguridad de la IaC: buckets publicos, reglas de firewall
+      # abiertas, cifrado ausente.
+      - id: terrascan
+        args:
+          - --args=--severity=high
+          - --args=--skip-rules=AC_GCP_0011
+
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v5.0.0
+    hooks:
+      # Fallos tontos que ensucian un diff y se cuelan sin querer.
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-merge-conflict
+      - id: mixed-line-ending
+        args: ["--fix=lf"]
+
+      # Red de seguridad: impide commitear un fichero grande por accidente,
+      # tipico de un binario de provider que se escapa del .gitignore.
+      - id: check-added-large-files
+        args: ["--maxkb=1024"]
+
+  # Ultima linea de defensa contra credenciales. El repositorio no deberia
+  # tener ninguna (se generan y viven en Secret Manager), pero un hook que
+  # nunca salta cuesta nada y el dia que salte lo vale.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.21.2
+    hooks:
+      - id: gitleaks

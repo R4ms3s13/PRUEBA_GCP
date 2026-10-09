@@ -1,0 +1,15 @@
+# Configuracion del analisis de seguridad de la IaC.
+# La usan las dos implementaciones del pipeline (Cloud Build y GitHub Actions).
+
+severity:
+  - HIGH
+  - CRITICAL
+
+exit-code: 1
+
+misconfiguration:
+  include-non-failures: false
+
+scan:
+  skip-dirs:
+    - "**/.terraform"

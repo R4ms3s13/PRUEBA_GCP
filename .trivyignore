@@ -1,0 +1,8 @@
+# Excepciones del analisis de IaC. Trivy las lee de este fichero, no de una
+# clave del yaml de configuracion. Cada una documenta POR QUE no aplica aqui;
+# sin justificacion no se anade ninguna.
+
+# El bucket del frontend es publico POR DISENO: contiene el build de un SPA que
+# sirve una web publica. El contenido sensible vive en los buckets uploads,
+# exports y db-backups, los tres con public_access_prevention = enforced.
+AVD-GCP-0001

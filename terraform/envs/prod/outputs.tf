@@ -1,0 +1,14 @@
+output "lb_ip_address" { value = module.plataforma.lb_ip_address }
+output "public_url" { value = module.plataforma.public_url }
+output "api_service_name" { value = module.plataforma.api_service_name }
+output "worker_service_name" { value = module.plataforma.worker_service_name }
+output "batch_job_names" { value = module.plataforma.batch_job_names }
+output "db_instance_name" { value = module.plataforma.db_instance_name }
+output "db_connection_name" { value = module.plataforma.db_connection_name }
+output "buckets" { value = module.plataforma.buckets }
+output "image_base" { value = module.plataforma.image_base }
+output "pubsub_topics" { value = module.plataforma.pubsub_topics }
+output "service_accounts" { value = module.plataforma.service_accounts }
+output "deployer_service_account" { value = module.plataforma.deployer_service_account }
+output "nat_ip" { value = module.plataforma.nat_ip }
+output "dashboard_id" { value = module.plataforma.dashboard_id }

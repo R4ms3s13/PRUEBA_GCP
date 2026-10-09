@@ -1,0 +1,155 @@
+# ===========================================================================
+# Pipeline de FRONTEND con servicios nativos de GCP.
+#
+# El frontend es un artefacto distinto del backend: objetos estaticos en Cloud
+# Storage, no un contenedor en Cloud Run. Tiene su propio pipeline porque se
+# despliega de forma independiente (D9b): un cambio de CSS no debe pagar el
+# build de tres imagenes, el escaneo de vulnerabilidades y las migraciones.
+#
+#   Cloud Build trigger (includedFiles: app/frontend/**)
+#        |
+#        v
+#   npm ci -> lint -> test -> build de Vite
+#        |
+#        v
+#   Cloud Storage (rsync con cabeceras de cache)
+#        |
+#        v
+#   Invalidacion de Cloud CDN para /index.html
+#
+# Lo que hace seguro desplegarlo por separado es el contrato con el API: la
+# llamada es relativa (/api, D3) y el API mantiene compatibilidad con N-1
+# (obligatorio de todas formas por el canary, D9b). Ningun orden de publicacion
+# entre frontend y backend produce una combinacion incompatible.
+#
+# Sustituir SUSTITUIR_* por los valores del proyecto, o pasarlos como
+# substitutions del trigger.
+# ===========================================================================
+
+substitutions:
+  _REGION: europe-west1
+  _ENV: dev
+  _PREFIX: prov-dev
+  _FRONTEND_BUCKET: SUSTITUIR_BUCKET_FRONTEND
+  _PUBLIC_URL: SUSTITUIR_URL_PUBLICA
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+  dynamicSubstitutions: true
+
+# Corre con la SA de despliegue del ambiente, no con la SA por defecto de Cloud
+# Build. Para el frontend solo necesita escritura en el bucket e invalidacion
+# de CDN; no toca Cloud Run ni la base de datos.
+serviceAccount: projects/$PROJECT_ID/serviceAccounts/${_PREFIX}-deployer@$PROJECT_ID.iam.gserviceaccount.com
+
+steps:
+  # -------------------------------------------------------------------------
+  # 1. Dependencias, lint y tests del frontend. Si falla, no se publica nada.
+  # -------------------------------------------------------------------------
+  - id: deps
+    name: node:22-slim
+    dir: app/frontend
+    entrypoint: npm
+    args: ["ci"]
+
+  - id: lint-test
+    name: node:22-slim
+    dir: app/frontend
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        npm run lint
+        npm test -- --run
+        npm audit --audit-level=high
+    waitFor: ["deps"]
+
+  # -------------------------------------------------------------------------
+  # 2. Build de produccion. VITE_API_BASE es relativo: el mismo dominio sirve
+  #    frontend y API (D3), asi que el bundle no lleva dentro el host del
+  #    backend y el mismo artefacto valdria en cualquier ambiente.
+  # -------------------------------------------------------------------------
+  - id: build
+    name: node:22-slim
+    dir: app/frontend
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        VITE_API_BASE=/api npm run build
+        test -f dist/index.html || { echo "El build no produjo dist/index.html"; exit 1; }
+    waitFor: ["lint-test"]
+
+  # -------------------------------------------------------------------------
+  # 3. Publicacion en el bucket, con las cabeceras de cache correctas.
+  #
+  #    El orden importa: primero los assets, despues index.html. Los assets
+  #    llevan hash en el nombre, de modo que publicar los nuevos no invalida
+  #    los que el index.html antiguo sigue pidiendo. Si se publicara primero
+  #    index.html, durante unos segundos pediria assets que aun no existen.
+  # -------------------------------------------------------------------------
+  - id: publicar-assets
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        # Assets con hash en el nombre: cache de un ano, inmutables.
+        # --delete-unmatched-destination-objects retira los huerfanos de
+        # despliegues anteriores, pero index.html queda excluido para no
+        # borrarlo entre este paso y el siguiente.
+        gcloud storage rsync app/frontend/dist gs://${_FRONTEND_BUCKET} \
+          --recursive --delete-unmatched-destination-objects \
+          --cache-control="public, max-age=31536000, immutable" \
+          --exclude="index.html"
+    waitFor: ["build"]
+
+  - id: publicar-index
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        # index.html sin cache: es el que apunta a los assets nuevos, y un
+        # despliegue debe verse de inmediato.
+        gcloud storage cp app/frontend/dist/index.html \
+          gs://${_FRONTEND_BUCKET}/index.html \
+          --cache-control="no-cache, max-age=0"
+    waitFor: ["publicar-assets"]
+
+  # -------------------------------------------------------------------------
+  # 4. Invalidacion del CDN. Solo para /index.html: los assets son inmutables
+  #    y cambian de nombre, de modo que invalidar todo seria tirar una cache
+  #    que sigue siendo valida.
+  # -------------------------------------------------------------------------
+  - id: invalidar-cdn
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        gcloud compute url-maps invalidate-cdn-cache ${_PREFIX}-urlmap \
+          --path="/index.html" --async
+    waitFor: ["publicar-index"]
+
+  # -------------------------------------------------------------------------
+  # 5. Verificacion: el documento de entrada se sirve y es el recien publicado.
+  # -------------------------------------------------------------------------
+  - id: verificar
+    name: gcr.io/cloud-builders/curl
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        curl -fsS --retry 5 --retry-delay 10 "${_PUBLIC_URL}/" > /dev/null
+        echo "Frontend publicado en ${_ENV}"
+    waitFor: ["invalidar-cdn"]
+
+timeout: 900s

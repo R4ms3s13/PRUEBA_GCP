@@ -1,0 +1,47 @@
+# ===========================================================================
+# Dependabot.
+#
+# Fijar las acciones por SHA (ver los workflows) elimina el riesgo de que una
+# etiqueta movil cambie bajo los pies, pero introduce el riesgo opuesto: un pin
+# que nadie actualiza se queda con los fallos de seguridad del dia que se puso.
+#
+# Dependabot resuelve esa mitad: abre un PR con el SHA nuevo y el changelog,
+# de modo que actualizar sigue siendo una decision revisada y no un cambio
+# silencioso. Es la pieza que hace sostenible el pin por SHA (D16).
+# ===========================================================================
+
+version: 2
+
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+    # Las actualizaciones de acciones se agrupan: son casi siempre bumps de
+    # version sin cambio funcional, y un PR por accion y semana genera ruido
+    # que acaba en que nadie los lee.
+    groups:
+      acciones:
+        patterns: ["*"]
+    commit-message:
+      prefix: "ci"
+    labels: ["dependencias", "ci"]
+    open-pull-requests-limit: 5
+
+  # Terraform. El provider esta fijado en los .terraform.lock.hcl, asi que aqui
+  # el valor esta en enterarse de que hay version nueva, no en que se aplique
+  # sola.
+  - package-ecosystem: terraform
+    directories:
+      - /terraform/envs/dev
+      - /terraform/envs/qa
+      - /terraform/envs/prod
+      - /terraform/bootstrap
+      - /terraform/platform
+      - /terraform/modules/*
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: "terraform"
+    labels: ["dependencias", "terraform"]
+    open-pull-requests-limit: 3

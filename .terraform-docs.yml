@@ -1,0 +1,45 @@
+# Configuracion de terraform-docs.
+#
+# Genera la seccion "Referencia" de cada README entre los marcadores
+# BEGIN_TF_DOCS / END_TF_DOCS. La parte escrita a mano (proposito, decisiones
+# de diseno, ejemplo de uso) queda intacta: terraform-docs solo toca lo que
+# puede derivar del codigo, que es justo lo que se desactualiza al editarlo.
+#
+# Regenerar tras cualquier cambio en variables, outputs o recursos:
+#   terraform-docs .
+
+formatter: markdown table
+
+output:
+  file: README.md
+  mode: inject
+  template: |-
+    <!-- BEGIN_TF_DOCS -->
+    {{ .Content }}
+    <!-- END_TF_DOCS -->
+
+sections:
+  show:
+    - requirements
+    - providers
+    - resources
+    - inputs
+    - outputs
+
+sort:
+  enabled: true
+  by: required
+
+settings:
+  anchor: true
+  color: true
+  default: true
+  description: true
+  escape: true
+  hide-empty: true
+  html: true
+  indent: 3
+  lockfile: false
+  required: true
+  sensitive: true
+  type: true

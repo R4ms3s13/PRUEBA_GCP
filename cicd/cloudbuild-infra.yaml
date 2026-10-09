@@ -1,0 +1,136 @@
+# ===========================================================================
+# Pipeline de INFRAESTRUCTURA con Cloud Build.
+#
+# Dos triggers sobre este mismo fichero:
+#   - Pull request  -> _ACCION=plan   (no modifica nada)
+#   - Push a main   -> _ACCION=apply  (solo dev y qa)
+#   - Prod          -> ejecucion manual aprobada (trigger con approval: true)
+#
+# El bloqueo de state lo da el backend GCS: dos ejecuciones simultaneas no
+# pueden corromper el state, la segunda espera o falla.
+# ===========================================================================
+
+substitutions:
+  _ENV: dev
+  _ACCION: plan
+  _TF_VERSION: "1.9.8"
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_STANDARD_2
+  dynamicSubstitutions: true
+
+serviceAccount: projects/$PROJECT_ID/serviceAccounts/tf-infra-${_ENV}@$PROJECT_ID.iam.gserviceaccount.com
+
+steps:
+  # -------------------------------------------------------------------------
+  - id: fmt
+    name: hashicorp/terraform:${_TF_VERSION}
+    entrypoint: terraform
+    args: ["fmt", "-check", "-recursive", "terraform/"]
+
+  - id: init
+    name: hashicorp/terraform:${_TF_VERSION}
+    dir: terraform/envs/${_ENV}
+    entrypoint: terraform
+    args: ["init", "-backend-config=backend.hcl"]
+    waitFor: ["fmt"]
+
+  - id: validate
+    name: hashicorp/terraform:${_TF_VERSION}
+    dir: terraform/envs/${_ENV}
+    entrypoint: terraform
+    args: ["validate"]
+    waitFor: ["init"]
+
+  # -------------------------------------------------------------------------
+  # Linter de Terraform. El plugin de Google valida tipos de maquina, nombres
+  # y argumentos contra la API ANTES de llamarla.
+  # -------------------------------------------------------------------------
+  - id: tflint
+    name: ghcr.io/terraform-linters/tflint:latest
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        set -e
+        tflint --init --config=/workspace/.tflint.hcl
+        tflint --recursive --config=/workspace/.tflint.hcl --chdir=terraform
+    waitFor: ["validate"]
+
+  # -------------------------------------------------------------------------
+  # Analisis de seguridad de la propia IaC antes de aplicarla.
+  # -------------------------------------------------------------------------
+  - id: seguridad
+    name: aquasec/trivy:latest
+    args:
+      - config
+      - --severity
+      - HIGH,CRITICAL
+      - --exit-code
+      - "1"
+      - terraform/
+    waitFor: ["validate"]
+
+  # -------------------------------------------------------------------------
+  # La documentacion generada debe estar al dia en el commit. Si no lo esta,
+  # el README miente a quien lo lee, que es peor que no tenerlo.
+  # -------------------------------------------------------------------------
+  - id: docs-al-dia
+    name: quay.io/terraform-docs/terraform-docs:latest
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        set -e
+        for d in terraform/modules/*/ terraform/platform terraform/bootstrap; do
+          terraform-docs markdown table --config .terraform-docs.yml "$$d" --output-file README.md --output-check
+        done
+    waitFor: ["validate"]
+
+  # -------------------------------------------------------------------------
+  - id: plan
+    name: hashicorp/terraform:${_TF_VERSION}
+    dir: terraform/envs/${_ENV}
+    entrypoint: terraform
+    args: ["plan", "-lock-timeout=10m", "-out=tfplan"]
+    waitFor: ["seguridad", "docs-al-dia", "tflint"]
+
+  # -------------------------------------------------------------------------
+  # Apply solo cuando _ACCION lo pide. Aplica el PLAN GUARDADO, no uno nuevo:
+  # garantiza que lo aplicado es exactamente lo revisado.
+  # -------------------------------------------------------------------------
+  - id: apply
+    name: hashicorp/terraform:${_TF_VERSION}
+    dir: terraform/envs/${_ENV}
+    entrypoint: sh
+    args:
+      - -c
+      - |
+        set -e
+        if [ "${_ACCION}" = "apply" ]; then
+          terraform apply -lock-timeout=10m tfplan
+          terraform output -json > /workspace/outputs-${_ENV}.json
+        else
+          echo "_ACCION=${_ACCION}: solo plan, no se aplica nada."
+        fi
+    waitFor: ["plan"]
+
+  # -------------------------------------------------------------------------
+  # Los outputs se guardan como artefacto: el pipeline de aplicacion los lee
+  # para conocer nombres de servicio y buckets sin tenerlos duplicados.
+  # -------------------------------------------------------------------------
+  - id: publicar-outputs
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        if [ -f /workspace/outputs-${_ENV}.json ]; then
+          gcloud storage cp /workspace/outputs-${_ENV}.json \
+            gs://proveedores-tfstate-${_ENV}/outputs/latest.json
+        fi
+    waitFor: ["apply"]
+
+timeout: 3600s

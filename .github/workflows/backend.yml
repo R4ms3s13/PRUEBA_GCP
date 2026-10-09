@@ -1,0 +1,333 @@
+# ===========================================================================
+# Pipeline de BACKEND.
+#
+# Construye las imagenes de API, worker y batch, las promociona por DIGEST (no
+# por etiqueta) y despliega con trafico gradual. Promocionar por digest es lo
+# que garantiza que el binario validado en qa es exactamente el que entra en
+# prod: una etiqueta puede reescribirse, un digest no.
+#
+# El frontend NO esta aqui: tiene su propio pipeline (frontend.yml) porque es
+# otro artefacto, con otro destino, y se despliega independientemente. La
+# decision y el contrato que lo hace seguro estan en D9b.
+#
+# Flujo:
+#   PR            -> test + build + analisis de vulnerabilidades (sin desplegar)
+#   merge a main  -> deploy dev -> smoke test -> deploy qa -> smoke test
+#   prod          -> aprobacion manual, canary 10% -> verificacion -> 100%
+# ===========================================================================
+
+name: Backend
+
+on:
+  pull_request:
+    paths:
+      - "app/api/**"
+      - "app/worker/**"
+      - "app/batch/**"
+      - "app/migraciones/**"
+      - "app/package.json"
+      - "app/package-lock.json"
+      - "app/Dockerfile.*"
+      - ".github/workflows/backend.yml"
+  push:
+    branches: [main]
+    paths:
+      - "app/api/**"
+      - "app/worker/**"
+      - "app/batch/**"
+      - "app/migraciones/**"
+      - "app/package.json"
+      - "app/package-lock.json"
+      - "app/Dockerfile.*"
+  workflow_dispatch:
+    inputs:
+      sha:
+        description: Commit validado en qa que se promociona a prod
+        required: true
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  REGION: europe-west1
+  REPO: plataforma
+  # Contrato de sonda con desarrollo, el mismo valor que app_health_path en
+  # Terraform.
+  HEALTH_PATH: /healthz
+
+jobs:
+  # -------------------------------------------------------------------------
+  test:
+    name: Test y lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: app/package-lock.json
+
+      # npm ci y no npm install: instala exactamente el lockfile, lo que hace
+      # el build reproducible.
+      - run: npm ci
+        working-directory: app
+
+      - run: npm run lint
+        working-directory: app
+
+      - run: npm test -- --coverage
+        working-directory: app
+
+      # Dependencias con vulnerabilidades conocidas: se corta aqui, no en prod.
+      - run: npm audit --audit-level=high
+        working-directory: app
+
+  # -------------------------------------------------------------------------
+  build:
+    name: Build y push (${{ matrix.componente }})
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        componente: [api, worker, batch]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER_dev }}
+          service_account: ${{ vars.DEPLOYER_SA_dev }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      - name: Autenticar Docker contra Artifact Registry
+        run: gcloud auth configure-docker ${{ env.REGION }}-docker.pkg.dev --quiet
+
+      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - id: build
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: app
+          file: app/Dockerfile.${{ matrix.componente }}
+          push: true
+          tags: |
+            ${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_dev }}/${{ env.REPO }}/${{ matrix.componente }}:${{ github.sha }}
+          # Cache entre ejecuciones: reduce el build de minutos a segundos.
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: true
+          sbom: true
+
+      # Analisis de la imagen construida, no solo del codigo fuente.
+      - name: Trivy sobre la imagen
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          image-ref: ${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_dev }}/${{ env.REPO }}/${{ matrix.componente }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+  # -------------------------------------------------------------------------
+  deploy_dev:
+    name: Deploy dev
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment: dev
+    steps:
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER_dev }}
+          service_account: ${{ vars.DEPLOYER_SA_dev }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      - name: Migraciones de base de datos
+        run: |
+          # Las migraciones son un job batch: corren dentro de la VPC, con la
+          # identidad del batch y acceso privado a la BBDD. Ejecutarlas desde
+          # el runner exigiria abrir la base de datos al exterior.
+          gcloud run jobs update prov-dev-migraciones \
+            --region=${{ env.REGION }} \
+            --image=${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_dev }}/${{ env.REPO }}/batch:${{ github.sha }}
+          gcloud run jobs execute prov-dev-migraciones \
+            --region=${{ env.REGION }} --wait
+
+      - name: Desplegar servicios
+        run: |
+          for c in api worker; do
+            gcloud run services update prov-dev-$c \
+              --region=${{ env.REGION }} \
+              --image=${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_dev }}/${{ env.REPO }}/$c:${{ github.sha }}
+          done
+
+      - name: Actualizar los jobs batch
+        run: |
+          for j in conciliacion-pedidos export-proveedores backup-logico-bbdd; do
+            gcloud run jobs update prov-dev-$j \
+              --region=${{ env.REGION }} \
+              --image=${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_dev }}/${{ env.REPO }}/batch:${{ github.sha }}
+          done
+
+      - name: Smoke test del API
+        run: curl -fsS --retry 5 --retry-delay 10 "${{ vars.URL_dev }}${{ env.HEALTH_PATH }}"
+
+  # -------------------------------------------------------------------------
+  deploy_qa:
+    name: Deploy qa
+    needs: deploy_dev
+    runs-on: ubuntu-latest
+    environment: qa
+    steps:
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER_qa }}
+          service_account: ${{ vars.DEPLOYER_SA_qa }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      # Copia por digest del registro de dev al de qa: el mismo binario, sin
+      # reconstruir. Un rebuild podria producir una imagen distinta.
+      - name: Promocionar imagen por digest
+        run: |
+          for c in api worker batch; do
+            gcloud artifacts docker images copy \
+              "${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_dev }}/${{ env.REPO }}/$c:${{ github.sha }}" \
+              "${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_qa }}/${{ env.REPO }}/$c:${{ github.sha }}" \
+              --quiet
+          done
+
+      - name: Migraciones y despliegue
+        run: |
+          gcloud run jobs update prov-qa-migraciones \
+            --region=${{ env.REGION }} \
+            --image=${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_qa }}/${{ env.REPO }}/batch:${{ github.sha }}
+          gcloud run jobs execute prov-qa-migraciones --region=${{ env.REGION }} --wait
+          for c in api worker; do
+            gcloud run services update prov-qa-$c \
+              --region=${{ env.REGION }} \
+              --image=${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_qa }}/${{ env.REPO }}/$c:${{ github.sha }}
+          done
+
+      - name: Pruebas de integracion
+        run: curl -fsS --retry 5 --retry-delay 10 "${{ vars.URL_qa }}${{ env.HEALTH_PATH }}"
+
+  # -------------------------------------------------------------------------
+  # PROD con canary. Esta es la parte que justifica separar los pipelines de
+  # infraestructura y aplicacion: el despliegue gradual es estado de release y
+  # vive aqui, no en Terraform (D9).
+  #
+  # Se promociona por digest, y el digest se RESUELVE por componente: api,
+  # worker y batch tienen digests distintos, porque son imagenes distintas. La
+  # entrada del workflow es el commit validado en qa, no un digest suelto.
+  # -------------------------------------------------------------------------
+  deploy_prod:
+    name: Deploy prod (canary)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: prod # revisores obligatorios: la aprobacion es humana
+    steps:
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER_prod }}
+          service_account: ${{ vars.DEPLOYER_SA_prod }}
+
+      - uses: google-github-actions/setup-gcloud@e427ad8a34f8676edf47cf7d7925499adf3eb74f # v2.2.1
+
+      - name: Resolver el digest de cada componente en qa
+        id: digests
+        run: |
+          set -euo pipefail
+          for c in api worker batch; do
+            D=$(gcloud artifacts docker images describe \
+              "${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_qa }}/${{ env.REPO }}/$c:${{ inputs.sha }}" \
+              --format='value(image_summary.digest)')
+            if [ -z "$D" ]; then
+              echo "No existe la imagen de $c para el commit ${{ inputs.sha }} en qa"
+              exit 1
+            fi
+            echo "digest_$c=$D" >> "$GITHUB_OUTPUT"
+            echo "$c -> $D"
+          done
+
+      # Cada componente se copia con SU digest. Antes esto recorria los tres
+      # componentes aplicando un unico digest de entrada, lo que no puede
+      # funcionar: un digest identifica una imagen concreta y no existe en el
+      # repositorio de las otras dos.
+      - name: Promocionar imagenes por digest
+        env:
+          DIGEST_API: ${{ steps.digests.outputs.digest_api }}
+          DIGEST_WORKER: ${{ steps.digests.outputs.digest_worker }}
+          DIGEST_BATCH: ${{ steps.digests.outputs.digest_batch }}
+        run: |
+          set -euo pipefail
+          promocionar() {
+            local c="$1" d="$2"
+            gcloud artifacts docker images copy \
+              "${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_qa }}/${{ env.REPO }}/$c@$d" \
+              "${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_prod }}/${{ env.REPO }}/$c@$d" \
+              --quiet
+          }
+          promocionar api    "$DIGEST_API"
+          promocionar worker "$DIGEST_WORKER"
+          promocionar batch  "$DIGEST_BATCH"
+
+      - name: Migraciones
+        run: |
+          # Expand/contract obligatorio: durante el canary conviven la revision
+          # antigua y la nueva contra el mismo esquema.
+          gcloud run jobs update prov-prod-migraciones \
+            --region=${{ env.REGION }} \
+            --image="${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_prod }}/${{ env.REPO }}/batch@${{ steps.digests.outputs.digest_batch }}"
+          gcloud run jobs execute prov-prod-migraciones --region=${{ env.REGION }} --wait
+
+      - name: Publicar revision sin trafico
+        run: |
+          gcloud run services update prov-prod-api \
+            --region=${{ env.REGION }} \
+            --image="${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_prod }}/${{ env.REPO }}/api@${{ steps.digests.outputs.digest_api }}" \
+            --no-traffic --tag=canary
+
+      - name: Canary al 10%
+        run: |
+          gcloud run services update-traffic prov-prod-api \
+            --region=${{ env.REGION }} --to-tags=canary=10
+
+      - name: Verificar el canary
+        run: |
+          # Ventana de observacion: si la tasa de error de la revision canary
+          # supera el umbral, se aborta y el 90% del trafico nunca la ve.
+          sleep 300
+          ERRORES=$(gcloud logging read \
+            'resource.type="cloud_run_revision"
+             AND resource.labels.service_name="prov-prod-api"
+             AND labels."run.googleapis.com/tag"="canary"
+             AND severity>=ERROR' \
+            --freshness=5m --format='value(timestamp)' | wc -l)
+          echo "Errores en la revision canary: $ERRORES"
+          if [ "$ERRORES" -gt 10 ]; then
+            echo "Canary descartado por tasa de error"
+            gcloud run services update-traffic prov-prod-api \
+              --region=${{ env.REGION }} --to-latest=0
+            exit 1
+          fi
+
+      - name: Promocionar al 100%
+        run: |
+          gcloud run services update-traffic prov-prod-api \
+            --region=${{ env.REGION }} --to-tags=canary=100
+
+      - name: Desplegar worker y jobs batch
+        run: |
+          gcloud run services update prov-prod-worker \
+            --region=${{ env.REGION }} \
+            --image="${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_prod }}/${{ env.REPO }}/worker@${{ steps.digests.outputs.digest_worker }}"
+          for j in conciliacion-pedidos export-proveedores backup-logico-bbdd; do
+            gcloud run jobs update prov-prod-$j \
+              --region=${{ env.REGION }} \
+              --image="${{ env.REGION }}-docker.pkg.dev/${{ vars.PROJECT_prod }}/${{ env.REPO }}/batch@${{ steps.digests.outputs.digest_batch }}"
+          done

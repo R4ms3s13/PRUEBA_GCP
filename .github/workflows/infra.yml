@@ -1,0 +1,243 @@
+# ===========================================================================
+# Pipeline de INFRAESTRUCTURA.
+#
+# Separado del de aplicacion a proposito: cambian a ritmos distintos y tienen
+# riesgos distintos. Un despliegue de aplicacion es diario y reversible; un
+# cambio de red o de IAM es ocasional y puede cortar el servicio.
+#
+# Autenticacion: Workload Identity Federation. No hay ninguna clave de service
+# account almacenada en GitHub, solo el identificador del proveedor OIDC.
+#
+# Flujo:
+#   PR            -> fmt + validate + tflint + plan de los 3 ambientes (comentado en el PR)
+#   merge a main  -> apply en dev, luego en qa
+#   prod          -> requiere aprobacion manual (GitHub Environment protegido)
+# ===========================================================================
+
+name: Infraestructura
+
+on:
+  pull_request:
+    paths: ["terraform/**", ".github/workflows/infra.yml"]
+  push:
+    branches: [main]
+    paths: ["terraform/**"]
+  workflow_dispatch:
+    inputs:
+      ambiente:
+        description: Ambiente a desplegar
+        type: choice
+        options: [dev, qa, prod]
+        required: true
+
+permissions:
+  contents: read
+  id-token: write      # imprescindible para WIF
+  pull-requests: write # para publicar el plan como comentario
+
+env:
+  TF_VERSION: "1.9.8"
+  TF_IN_AUTOMATION: "true"
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Calidad estatica. Barato y rapido: corta antes de tocar la nube.
+  # -------------------------------------------------------------------------
+  validacion:
+    name: Formato y validacion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform fmt
+        run: terraform fmt -check -recursive terraform/
+
+      - name: Validar cada ambiente
+        run: |
+          for e in dev qa prod; do
+            echo "::group::validate $e"
+            terraform -chdir=terraform/envs/$e init -backend=false
+            terraform -chdir=terraform/envs/$e validate
+            echo "::endgroup::"
+          done
+
+      - uses: terraform-linters/setup-tflint@90f302c255ef959cbfb4bd10581afecdb7ece3e6 # v4
+        with:
+          tflint_version: latest
+
+      # --init descarga el plugin de Google, que es donde estan las reglas
+      # que de verdad valen: tipos de maquina inexistentes, nombres mal
+      # formados, argumentos invalidos. Sin el, tflint apenas comprueba nada.
+      - name: tflint
+        run: |
+          tflint --init --config="$(pwd)/.tflint.hcl"
+          tflint --recursive --config="$(pwd)/.tflint.hcl" --chdir=terraform
+
+      # La documentacion generada debe estar al dia en el commit. Si alguien
+      # anade una variable y no regenera, el diff lo delata aqui y no tres
+      # semanas despues, cuando el README ya engaña a quien lo lee.
+      - name: Documentacion de modulos al dia
+        uses: terraform-docs/gh-actions@6de6da0cefcc6b4b7a5cbea4d79d97060733093c # v1.4.1
+        with:
+          working-dir: terraform/modules,terraform/platform,terraform/bootstrap
+          config-file: ../../.terraform-docs.yml
+          output-file: README.md
+          output-method: inject
+          fail-on-diff: true
+
+  # -------------------------------------------------------------------------
+  # Analisis de seguridad de la IaC. Detecta buckets publicos, reglas de
+  # firewall abiertas, falta de cifrado, etc. ANTES de aplicar.
+  # -------------------------------------------------------------------------
+  seguridad:
+    name: Analisis de seguridad (IaC)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Trivy sobre configuracion
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: config
+          scan-ref: terraform/
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          trivy-config: trivy.yaml
+
+  # -------------------------------------------------------------------------
+  # Plan en los tres ambientes, publicado en el PR para que la revision vea el
+  # impacto real antes de aprobar.
+  # -------------------------------------------------------------------------
+  plan:
+    name: Plan (${{ matrix.ambiente }})
+    if: github.event_name == 'pull_request'
+    needs: [validacion, seguridad]
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        ambiente: [dev, qa, prod]
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - id: auth
+        uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ vars[format('WIF_PROVIDER_{0}', matrix.ambiente)] }}
+          service_account: ${{ vars[format('TF_SA_{0}', matrix.ambiente)] }}
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Init
+        working-directory: terraform/envs/${{ matrix.ambiente }}
+        run: terraform init -backend-config=backend.hcl
+
+      - name: Plan
+        id: plan
+        working-directory: terraform/envs/${{ matrix.ambiente }}
+        run: |
+          terraform plan -no-color -lock-timeout=5m -out=tfplan | tee plan.txt
+          echo "resumen=$(grep -E '^(Plan|No changes)' plan.txt | head -1)" >> "$GITHUB_OUTPUT"
+
+      - name: Comentar el plan en el PR
+        uses: actions/github-script@f28e40c7f34bde8b3046d885e986cb6290c5673b # v7
+        env:
+          AMBIENTE: ${{ matrix.ambiente }}
+          RESUMEN: ${{ steps.plan.outputs.resumen }}
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync(
+              `terraform/envs/${process.env.AMBIENTE}/plan.txt`, 'utf8'
+            );
+            const cuerpo = [
+              `### Plan \`${process.env.AMBIENTE}\``,
+              '',
+              `**${process.env.RESUMEN}**`,
+              '',
+              '<details><summary>Plan completo</summary>',
+              '',
+              '```terraform',
+              plan.length > 60000 ? plan.slice(0, 60000) + '\n... (truncado)' : plan,
+              '```',
+              '</details>',
+            ].join('\n');
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: cuerpo,
+            });
+
+  # -------------------------------------------------------------------------
+  # Apply en dev y qa de forma automatica tras el merge.
+  # -------------------------------------------------------------------------
+  apply_dev_qa:
+    name: Apply (${{ matrix.ambiente }})
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: [validacion, seguridad]
+    runs-on: ubuntu-latest
+    strategy:
+      max-parallel: 1 # dev primero; si rompe, qa no se toca
+      matrix:
+        ambiente: [dev, qa]
+    environment: ${{ matrix.ambiente }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ vars[format('WIF_PROVIDER_{0}', matrix.ambiente)] }}
+          service_account: ${{ vars[format('TF_SA_{0}', matrix.ambiente)] }}
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      # Se genera un plan y se aplica ESE plan, no uno nuevo. Con
+      # `apply -auto-approve` a secas, lo aplicado puede diferir de lo
+      # planificado si el estado real cambio entre ambos momentos: es
+      # exactamente el fallo que un pipeline de infraestructura debe evitar.
+      - name: Plan
+        working-directory: terraform/envs/${{ matrix.ambiente }}
+        run: |
+          terraform init -backend-config=backend.hcl
+          terraform plan -lock-timeout=10m -out=tfplan
+
+      - name: Apply del plan generado
+        working-directory: terraform/envs/${{ matrix.ambiente }}
+        run: terraform apply -lock-timeout=10m tfplan
+
+  # -------------------------------------------------------------------------
+  # PROD: nunca automatico. El GitHub Environment "prod" lleva revisores
+  # obligatorios, de modo que el job espera una aprobacion humana explicita.
+  # -------------------------------------------------------------------------
+  apply_prod:
+    name: Apply (prod)
+    if: github.event_name == 'workflow_dispatch' && inputs.ambiente == 'prod'
+    runs-on: ubuntu-latest
+    environment: prod
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - uses: google-github-actions/auth@c200f3691d83b41bf9bbd8638997a462592937ed # v2.1.13
+        with:
+          workload_identity_provider: ${{ vars.WIF_PROVIDER_prod }}
+          service_account: ${{ vars.TF_SA_prod }}
+
+      - uses: hashicorp/setup-terraform@b9cd54a3c349d3f38e8881555d616ced269862dd # v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: Plan y apply del plan revisado
+        working-directory: terraform/envs/prod
+        run: |
+          terraform init -backend-config=backend.hcl
+          terraform plan -lock-timeout=10m -out=tfplan
+          terraform apply -lock-timeout=10m tfplan

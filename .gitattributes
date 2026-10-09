@@ -1,0 +1,31 @@
+# Normalizacion de finales de linea.
+#
+# El repositorio se crea en Windows pero se consume en Linux: los runners de
+# CI/CD y los contenedores de Cloud Build. Sin esto, un fichero con CRLF da
+# errores dificiles de diagnosticar, como "bad interpreter: /usr/bin/env bash^M"
+# en un script que en local funciona perfectamente.
+
+# Por defecto: git normaliza a LF en el repositorio y respeta el final de linea
+# nativo en la copia de trabajo.
+* text=auto
+
+# Estos SIEMPRE con LF, tambien en la copia de trabajo de Windows: los ejecuta
+# un shell de Linux y CRLF los rompe.
+*.sh            text eol=lf
+*.yml           text eol=lf
+*.yaml          text eol=lf
+*.tf            text eol=lf
+*.tfvars        text eol=lf
+*.hcl           text eol=lf
+
+# Binarios: git no debe tocarlos.
+*.png           binary
+*.jpg           binary
+*.pdf           binary
+
+# El SVG es texto, pero no interesa verlo en los diffs: se genera.
+*.svg           text eol=lf linguist-generated=true
+
+# Marcar como generada la seccion de referencia de los README de modulo evita
+# que ensucie las estadisticas de lenguaje del repositorio.
+docs/img/*      linguist-documentation=true

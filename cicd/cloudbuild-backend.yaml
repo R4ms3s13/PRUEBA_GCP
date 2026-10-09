@@ -1,0 +1,235 @@
+# ===========================================================================
+# Pipeline de BACKEND con servicios nativos de GCP.
+#
+# Esta es la implementacion que pide el enunciado ("utilizando los servicios de
+# GCP"). Cubre los tres contenedores -API, worker y jobs batch- y las
+# migraciones de base de datos. El frontend tiene su propio pipeline
+# (cloudbuild-frontend.yaml) porque es otro artefacto, con otro destino, y se
+# despliega independientemente: ver D9b.
+#
+#   Cloud Source Repositories / GitHub
+#        |  (trigger con includedFiles: app/api/**, app/worker/**, app/batch/**)
+#        v
+#   Cloud Build  --build-->  Artifact Registry  --scan-->  Artifact Analysis
+#        |                                                      |
+#        |  despliega                            Binary Authorization verifica
+#        v                                       la atestacion antes de admitir
+#   Cloud Run (api / worker / jobs)              la imagen en prod
+#        |
+#        v
+#   Cloud Deploy (promocion dev -> qa -> prod con aprobacion)
+#
+# CONTRATO que permite desplegar sin coordinar con el frontend (D9b):
+#   - El API mantiene compatibilidad con la version N-1 del cliente. No es una
+#     concesion al frontend: el canary de prod hace convivir dos revisiones del
+#     API sirviendo trafico, de modo que ya es obligatorio.
+#   - Las migraciones son expand/contract, por la misma razon: durante el canary
+#     dos versiones del codigo atacan el mismo esquema.
+#
+# Sustituir SUSTITUIR_* por los valores del proyecto, o pasarlos como
+# substitutions del trigger.
+# ===========================================================================
+
+substitutions:
+  _REGION: europe-west1
+  _REPO: plataforma
+  _ENV: dev
+  _PREFIX: prov-dev
+  _PUBLIC_URL: SUSTITUIR_URL_PUBLICA
+  # Mismo valor que la variable app_health_path de Terraform: es el contrato de
+  # sonda con desarrollo, y vive en un solo sitio por ambos lados.
+  _HEALTH_PATH: /healthz
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
+  dynamicSubstitutions: true
+
+# El pipeline corre con la SA de despliegue del ambiente, no con la SA por
+# defecto de Cloud Build (que es mucho mas permisiva).
+serviceAccount: projects/$PROJECT_ID/serviceAccounts/${_PREFIX}-deployer@$PROJECT_ID.iam.gserviceaccount.com
+
+steps:
+  # -------------------------------------------------------------------------
+  # 1. Dependencias y tests. Si falla, no se construye nada.
+  # -------------------------------------------------------------------------
+  - id: deps
+    name: node:22-slim
+    dir: app
+    entrypoint: npm
+    args: ["ci"]
+
+  - id: lint-test
+    name: node:22-slim
+    dir: app
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        npm run lint
+        npm test -- --coverage
+        npm audit --audit-level=high
+    waitFor: ["deps"]
+
+  # -------------------------------------------------------------------------
+  # 2. Build de las tres imagenes en paralelo (waitFor comun).
+  # -------------------------------------------------------------------------
+  - id: build-api
+    name: gcr.io/cloud-builders/docker
+    dir: app
+    args:
+      - build
+      - -f
+      - Dockerfile.api
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/api:$SHORT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/api:latest
+      - --cache-from
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/api:latest
+      - .
+    waitFor: ["lint-test"]
+
+  - id: build-worker
+    name: gcr.io/cloud-builders/docker
+    dir: app
+    args:
+      - build
+      - -f
+      - Dockerfile.worker
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/worker:$SHORT_SHA
+      - .
+    waitFor: ["lint-test"]
+
+  - id: build-batch
+    name: gcr.io/cloud-builders/docker
+    dir: app
+    args:
+      - build
+      - -f
+      - Dockerfile.batch
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/batch:$SHORT_SHA
+      - .
+    waitFor: ["lint-test"]
+
+  # -------------------------------------------------------------------------
+  # 3. Push a Artifact Registry. Dispara el analisis de vulnerabilidades
+  #    automatico de Artifact Analysis.
+  # -------------------------------------------------------------------------
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        for c in api worker batch; do
+          docker push --all-tags ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/$$c
+        done
+    waitFor: ["build-api", "build-worker", "build-batch"]
+
+  # -------------------------------------------------------------------------
+  # 4. Puerta de vulnerabilidades: consulta el resultado del escaneo y corta si
+  #    aparecen criticas corregibles. Se revisan las TRES imagenes, no solo el
+  #    API: el worker y el batch corren el mismo riesgo y tienen acceso a la
+  #    base de datos.
+  # -------------------------------------------------------------------------
+  - id: gate-vulnerabilidades
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        echo "Esperando el analisis de Artifact Analysis..."
+        sleep 60
+        TOTAL=0
+        for c in api worker batch; do
+          IMG="${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/$$c"
+          DIGEST=$$(gcloud artifacts docker images describe \
+            "$$IMG:$SHORT_SHA" --format='value(image_summary.digest)')
+          N=$$(gcloud artifacts docker images list-vulnerabilities \
+            "$$IMG@$$DIGEST" \
+            --format='value(vulnerability.effectiveSeverity)' 2>/dev/null \
+            | grep -c CRITICAL || true)
+          echo "$$c: $$N criticas"
+          TOTAL=$$((TOTAL + N))
+        done
+        echo "Vulnerabilidades criticas en total: $$TOTAL"
+        if [ "$$TOTAL" -gt 0 ] && [ "${_ENV}" = "prod" ]; then
+          echo "Bloqueado: imagen con vulnerabilidades criticas no entra en prod"
+          exit 1
+        fi
+    waitFor: ["push"]
+
+  # -------------------------------------------------------------------------
+  # 5. Migraciones. Como job dentro de la VPC: la BBDD no se expone al builder.
+  #    Expand/contract, porque durante el canary la revision anterior del API
+  #    sigue sirviendo trafico contra el mismo esquema.
+  # -------------------------------------------------------------------------
+  - id: migraciones
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        gcloud run jobs update ${_PREFIX}-migraciones \
+          --region=${_REGION} \
+          --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/batch:$SHORT_SHA
+        gcloud run jobs execute ${_PREFIX}-migraciones --region=${_REGION} --wait
+    waitFor: ["gate-vulnerabilidades"]
+
+  # -------------------------------------------------------------------------
+  # 6. Despliegue. En prod la revision se publica SIN trafico; el reparto lo
+  #    gobierna Cloud Deploy con aprobacion manual.
+  # -------------------------------------------------------------------------
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk:slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        set -e
+        TRAFICO=""
+        if [ "${_ENV}" = "prod" ]; then
+          TRAFICO="--no-traffic --tag=candidata"
+        fi
+        gcloud run services update ${_PREFIX}-api \
+          --region=${_REGION} \
+          --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/api:$SHORT_SHA \
+          $$TRAFICO
+        gcloud run services update ${_PREFIX}-worker \
+          --region=${_REGION} \
+          --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/worker:$SHORT_SHA
+        for j in conciliacion-pedidos export-proveedores backup-logico-bbdd; do
+          gcloud run jobs update ${_PREFIX}-$$j \
+            --region=${_REGION} \
+            --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/batch:$SHORT_SHA || true
+        done
+    waitFor: ["migraciones"]
+
+  # -------------------------------------------------------------------------
+  # 7. Smoke test contra el API. Si falla, el build queda en rojo y la alerta
+  #    salta. No comprueba el frontend: eso lo verifica su propio pipeline.
+  # -------------------------------------------------------------------------
+  - id: smoke-test
+    name: gcr.io/cloud-builders/curl
+    args:
+      - -fsS
+      - --retry
+      - "5"
+      - --retry-delay
+      - "10"
+      - ${_PUBLIC_URL}${_HEALTH_PATH}
+    waitFor: ["deploy"]
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/api:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/worker:$SHORT_SHA
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/${_REPO}/batch:$SHORT_SHA
+
+timeout: 1800s

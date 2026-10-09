@@ -1,0 +1,34 @@
+# Terraform
+.terraform/
+
+# .terraform.lock.hcl SI se versiona: fija la version exacta de cada provider
+# y es lo que hace reproducible el despliegue. Excluirlo seria un error.
+*.tfstate
+*.tfstate.*
+*.tfplan
+tfplan
+crash.log
+crash.*.log
+
+# Variables con valores reales. Los *.tfvars del repositorio son los de
+# ejemplo del ejercicio; un despliegue real NO debe versionar los suyos.
+*.auto.tfvars
+secrets.auto.tfvars
+override.tf
+override.tf.json
+*_override.tf
+
+# Credenciales. Nunca debe haber ninguna, pero por si acaso.
+*.json.key
+service-account*.json
+credentials.json
+.env
+.env.*
+
+# Salidas locales
+outputs-*.json
+plan.txt
+
+# Sistema
+.DS_Store
+Thumbs.db
